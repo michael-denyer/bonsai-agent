@@ -1,6 +1,6 @@
 ---
 name: bonsai
-description: Runs a task on the local Bonsai 2 27B model (PrismML ternary 27B, MLX, on this Mac) and returns its answer. Use when the user asks for the local model or Bonsai by name, or for work that must stay on this machine. The server starts itself when it is down. Text only, about 28 tokens/second, so keep tasks short and self-contained.
+description: Runs a task on the local Bonsai 2 27B model (PrismML ternary 27B, MLX, on this Mac) and returns its answer. Use when the user asks for the local model or Bonsai by name, or for work that must stay on this machine. The server starts itself when it is down. Text only. It reads prompts at about 270 tokens/second and writes at about 21, so keep the expected answer short and the task self-contained.
 tools: Bash
 model: haiku
 ---
