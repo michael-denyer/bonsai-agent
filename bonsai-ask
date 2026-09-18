@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""Ask the local Bonsai model, starting its server when nothing is serving."""
+
+import argparse
+import fcntl
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+BONSAI_HOME = Path(os.environ.get("BONSAI_HOME") or Path.home() / ".local/share/bonsai")
+PORT = int(os.environ.get("BONSAI_PORT") or 8091)
+BASE_URL = f"http://127.0.0.1:{PORT}"
+MODEL_DIR = BONSAI_HOME / "model"
+PIDFILE = BONSAI_HOME / "server.pid"
+LOCKFILE = BONSAI_HOME / "start.lock"
+LOGFILE = BONSAI_HOME / "logs/server.log"
+VENV_PYTHON = BONSAI_HOME / "venv/bin/python"
+SERVER = Path(__file__).resolve().parent / "server.py"
+HEALTH_TIMEOUT = 300.0
+REQUEST_TIMEOUT = 1800.0
+STOP_TIMEOUT = 10.0
+
+
+def log_tail(count=30):
+    try:
+        return "".join(LOGFILE.read_text(errors="replace").splitlines(True)[-count:])
+    except OSError:
+        return ""
+
+
+def die(message):
+    print(f"bonsai-ask: {message}", file=sys.stderr)
+    tail = log_tail()
+    if tail:
+        print(f"bonsai-ask: last 30 lines of {LOGFILE}", file=sys.stderr)
+        print(tail, file=sys.stderr, end="")
+    raise SystemExit(1)
+
+
+def health():
+    """Return the served model id, or None when nothing healthy answers."""
+    try:
+        with urllib.request.urlopen(f"{BASE_URL}/health", timeout=2.0) as response:
+            return json.load(response).get("model")
+    except (OSError, ValueError):
+        return None
+
+
+def read_pid():
+    """Return whatever pid the pidfile holds, trusted for reporting only."""
+    try:
+        return int(PIDFILE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def server_pid():
+    """Return the pidfile's pid only when that process really is our server.
+
+    A pid outlives its process, so after a crash or a reboot the pidfile can name an
+    unrelated live process. Signalling that pid would kill a stranger, and waiting on
+    it would burn the whole health timeout on a server that is never coming up.
+    Identity is the command line holding this script's own server.py path.
+    """
+    pid = read_pid()
+    if pid is None:
+        return None
+    probe = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "command="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return pid if str(SERVER) in probe.stdout else None
+
+
+def server_still_named():
+    """Report whether the pidfile still names a live server, re-reading it each call.
+
+    Re-reading matters while waiting: the caller that is actually starting the server
+    may replace the pid, and this caller should follow it rather than watch a pid that
+    has already been superseded.
+    """
+    return server_pid() is not None
+
+
+def spawn():
+    """Start the server detached and return a callable reporting it still runs."""
+    for path in (VENV_PYTHON, SERVER):
+        if not path.exists():
+            die(f"{path} is missing, run install.sh")
+    LOGFILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOGFILE, "a") as log:
+        child = subprocess.Popen(
+            [
+                str(VENV_PYTHON),
+                str(SERVER),
+                "--model-dir",
+                str(MODEL_DIR),
+                "--port",
+                str(PORT),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    PIDFILE.write_text(str(child.pid))
+    return lambda: child.poll() is None
+
+
+def wait_for_health(alive, timeout):
+    """Poll health until it answers, the server dies, or the timeout expires.
+
+    Args:
+        alive: Callable reporting whether the server process still runs. The caller
+            that spawned it passes a Popen.poll check, because its own child becomes
+            a zombie that a signal probe would still call alive. A caller that did
+            not spawn re-reads the pidfile instead, so it follows the real starter.
+        timeout: Seconds to wait before giving up.
+
+    Returns:
+        The model id reported by health.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        model = health()
+        if model:
+            return model
+        if not alive():
+            die("the server exited before it answered health")
+        time.sleep(0.5)
+    die(f"the server did not answer health within {timeout:.0f}s")
+
+
+def ensure_running():
+    """Return the model id of a healthy server, starting one when needed.
+
+    | health | pidfile process | action |
+    |---|---|---|
+    | ok | any | use it |
+    | down | alive | wait for health (another caller is starting it) |
+    | down | dead or missing | remove stale pidfile, start, wait |
+
+    The lock covers only the recheck and the spawn. Waiting for health happens after
+    releasing it, so a concurrent caller reaches row two and waits for the loading
+    server instead of starting a second one. Row two is also how a caller recovers
+    when its predecessor was killed while waiting for a server that is still loading.
+    """
+    model = health()
+    if model:
+        return model
+
+    BONSAI_HOME.mkdir(parents=True, exist_ok=True)
+    with open(LOCKFILE, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        model = health()
+        if model:
+            return model
+        if server_pid() is not None:
+            alive = server_still_named
+        else:
+            PIDFILE.unlink(missing_ok=True)
+            alive = spawn()
+    return wait_for_health(alive, HEALTH_TIMEOUT)
+
+
+def ask(prompt, system, enable_thinking, effort, max_tokens):
+    messages = [{"role": "system", "content": system}] if system else []
+    messages.append({"role": "user", "content": prompt})
+    body = json.dumps(
+        {
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "enable_thinking": enable_thinking,
+            "reasoning_effort": effort,
+        }
+    ).encode()
+    request = urllib.request.Request(
+        f"{BASE_URL}/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors="replace").strip()
+        die(f"the server returned HTTP {error.code}: {detail}")
+
+
+def status():
+    model = health()
+    if model:
+        print(f"up pid {server_pid()} model {model}")
+        return 0
+    stale = read_pid()
+    print(f"down stale pidfile pid {stale}" if stale else "down")
+    return 1
+
+
+def stop():
+    """Stop the server, treating an already stopped server as success."""
+    pid = server_pid()
+    if pid is None:
+        stale = read_pid()
+        PIDFILE.unlink(missing_ok=True)
+        model = health()
+        if model:
+            print(
+                f"bonsai-ask: {model} is still serving on {BASE_URL} but no pidfile"
+                " names it, so nothing was signalled",
+                file=sys.stderr,
+            )
+            return 1
+        note = "no server running"
+        if stale is not None:
+            note += f", discarded a pidfile naming pid {stale}"
+        print(f"bonsai-ask: {note}", file=sys.stderr)
+        return 0
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + STOP_TIMEOUT
+    while time.monotonic() < deadline:
+        if server_pid() is None:
+            break
+        time.sleep(0.2)
+    else:
+        os.kill(pid, signal.SIGKILL)
+    PIDFILE.unlink(missing_ok=True)
+    print(f"bonsai-ask: stopped pid {pid}", file=sys.stderr)
+    return 0
+
+
+def ask_once_restarting(prompt, args):
+    """Ask, restarting the server once when it goes away before the request lands.
+
+    The idle-exit deadline can fall between a healthy probe and the POST behind it,
+    and so can a crash or a concurrent --stop. One retry converges on an answer
+    without hiding a server that is genuinely broken, because a second failure dies
+    with the log tail. An HTTP status is not retried: that is the request's own fault.
+    """
+    for attempt in (1, 2):
+        ensure_running()
+        try:
+            return ask(
+                prompt, args.system, not args.no_think, args.effort, args.max_tokens
+            )
+        except (OSError, ValueError) as error:
+            if attempt == 2:
+                die(f"the completion request failed: {error}")
+            print(
+                f"bonsai-ask: the server went away, restarting it: {error}",
+                file=sys.stderr,
+            )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("prompt", nargs="?", help="prompt text, or stdin when absent")
+    parser.add_argument("--no-think", action="store_true")
+    parser.add_argument(
+        "--effort", choices=("xhigh", "medium", "low"), default="medium"
+    )
+    parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument("--system")
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--stop", action="store_true")
+    args = parser.parse_args()
+
+    if args.status:
+        return status()
+    if args.stop:
+        return stop()
+
+    prompt = (args.prompt if args.prompt is not None else sys.stdin.read()).strip()
+    if not prompt:
+        print("bonsai-ask: no prompt on the command line or stdin", file=sys.stderr)
+        return 2
+
+    payload = ask_once_restarting(prompt, args)
+    choice = payload["choices"][0]
+    usage = payload["usage"]
+    print(
+        f"bonsai-ask: {usage['completion_tokens']} tokens"
+        f" at {usage['tokens_per_second']:.1f} tok/s",
+        file=sys.stderr,
+    )
+    content = choice["message"]["content"]
+    if choice["finish_reason"] == "length" and not content:
+        print(
+            "bonsai-ask: the token budget ran out while thinking, raise --max-tokens",
+            file=sys.stderr,
+        )
+        return 1
+    print(content)
+    if choice["finish_reason"] == "length":
+        print(
+            "bonsai-ask: the answer was cut off at --max-tokens",
+            file=sys.stderr,
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
