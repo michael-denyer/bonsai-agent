@@ -1,5 +1,6 @@
-# mlx itself comes from the PrismML fork build; install.sh pins it with a uv override.
+# With BONSAI_MLX=fork, install.sh overrides the mlx pin with the PrismML fork build.
 # The model pack pins transformers==5.5.0, which carries GHSA-xrqw-3rrv-vx5w. 5.17.0 fixes it.
+mlx==0.32.2
 mlx-lm==0.31.3
 mlx-vlm==0.6.3
 transformers==5.17.0
