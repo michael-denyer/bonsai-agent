@@ -24,15 +24,7 @@ In Claude Code, ask for the `bonsai` agent by name, or say "use the local model"
 
 ## How it works
 
-```mermaid
-flowchart LR
-    CC[Claude Code<br/>main session] --> SA[bonsai subagent<br/>Haiku, Bash only]
-    SA --> ASK[bonsai-ask]
-    ASK -->|health check| SRV[server.py<br/>127.0.0.1:8091]
-    ASK -.->|start if down| SRV
-    SRV --> PACK[pack loader<br/>runtime/vision_artifact.py]
-    PACK --> MLX[MLX<br/>Metal]
-```
+![Claude Code's main session calls the bonsai subagent, which runs bonsai-ask. bonsai-ask health-checks server.py on 127.0.0.1:8091 and starts it if it is down. server.py loads the model through the pack loader onto MLX on Metal.](assets/bonsai-architecture.png)
 
 `bonsai-ask` decides what to do from two facts, the health endpoint and the pidfile.
 
