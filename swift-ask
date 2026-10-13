@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""Ask the local Swift 1.5 model through splash, starting the server when nothing is serving."""
+
+import argparse
+import fcntl
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+SWIFT_HOME = Path(os.environ.get("SWIFT_HOME") or Path.home() / ".local/share/swift")
+MODEL = os.environ.get("SWIFT_MODEL") or "ukisai/Swift-1.5-Qwen3.8-27B-GGUF:Q4_K_M"
+PORT = int(os.environ.get("SWIFT_PORT") or 8000)
+BASE_URL = f"http://127.0.0.1:{PORT}"
+PIDFILE = SWIFT_HOME / "server.pid"
+LOCKFILE = SWIFT_HOME / "start.lock"
+LOGFILE = SWIFT_HOME / "logs/server.log"
+SERVE_ARGS = ["--language-only", "--no-webui"]
+# The first start may download the model, about 17 GB for the default, so the
+# health wait is long. Later starts load from the Hugging Face cache.
+HEALTH_TIMEOUT = 1800.0
+REQUEST_TIMEOUT = 1800.0
+STOP_TIMEOUT = 20.0
+EFFORTS = ("max", "xhigh", "high", "medium", "low", "minimal")
+
+
+def log_tail(count=30):
+    try:
+        return "".join(LOGFILE.read_text(errors="replace").splitlines(True)[-count:])
+    except OSError:
+        return ""
+
+
+def die(message):
+    print(f"swift-ask: {message}", file=sys.stderr)
+    tail = log_tail()
+    if tail:
+        print(f"swift-ask: last 30 lines of {LOGFILE}", file=sys.stderr)
+        print(tail, file=sys.stderr, end="")
+    raise SystemExit(1)
+
+
+def health():
+    """Return the served model id, or None when nothing ready answers.
+
+    splash answers /ready with 200 only once the model is loaded. The id comes
+    from /v1/models, falling back to the configured model when that list is empty.
+    """
+    try:
+        with urllib.request.urlopen(f"{BASE_URL}/ready", timeout=2.0) as response:
+            if response.status != 200:
+                return None
+        with urllib.request.urlopen(f"{BASE_URL}/v1/models", timeout=2.0) as response:
+            data = json.load(response).get("data") or []
+    except (OSError, ValueError):
+        return None
+    return data[0].get("id", MODEL) if data else MODEL
+
+
+def read_pid():
+    """Return whatever pid the pidfile holds, trusted for reporting only."""
+    try:
+        return int(PIDFILE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def server_pid():
+    """Return the pidfile's pid only when that process really is our splash server.
+
+    A pid outlives its process, so after a crash or a reboot the pidfile can name an
+    unrelated live process. Identity is a command line that runs splash serve with
+    this script's model.
+    """
+    pid = read_pid()
+    if pid is None:
+        return None
+    probe = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "command="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    command = probe.stdout
+    return (
+        pid if "splash" in command and "serve" in command and MODEL in command else None
+    )
+
+
+def server_still_named():
+    """Report whether the pidfile still names a live server, re-reading it each call."""
+    return server_pid() is not None
+
+
+def spawn():
+    """Start splash serve detached and return a callable reporting it still runs."""
+    splash = shutil.which("splash")
+    if splash is None:
+        die("splash is not installed, run: brew install incoai/tap/splash")
+    LOGFILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOGFILE, "a") as log:
+        child = subprocess.Popen(
+            [splash, "serve", "--model", MODEL, "--port", str(PORT), *SERVE_ARGS],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    PIDFILE.write_text(str(child.pid))
+    return lambda: child.poll() is None
+
+
+def wait_for_health(alive, timeout):
+    """Poll health until it answers, the server dies, or the timeout expires."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        model = health()
+        if model:
+            return model
+        if not alive():
+            die("the server exited before it answered /ready")
+        time.sleep(1.0)
+    die(f"the server did not answer /ready within {timeout:.0f}s")
+
+
+def ensure_running():
+    """Return the model id of a ready server, starting one when needed.
+
+    | ready | pidfile process | action |
+    |---|---|---|
+    | ok | any | use it |
+    | down | alive | wait (another caller is starting it) |
+    | down | dead or missing | remove stale pidfile, start, wait |
+
+    The lock covers only the recheck and the spawn, so a concurrent caller waits for
+    the loading server instead of starting a second one.
+    """
+    model = health()
+    if model:
+        return model
+
+    SWIFT_HOME.mkdir(parents=True, exist_ok=True)
+    with open(LOCKFILE, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        model = health()
+        if model:
+            return model
+        if server_pid() is not None:
+            alive = server_still_named
+        else:
+            PIDFILE.unlink(missing_ok=True)
+            alive = spawn()
+    return wait_for_health(alive, HEALTH_TIMEOUT)
+
+
+def ask(model, prompt, system, effort, max_tokens):
+    messages = [{"role": "system", "content": system}] if system else []
+    messages.append({"role": "user", "content": prompt})
+    body = json.dumps(
+        {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "reasoning_effort": effort,
+        }
+    ).encode()
+    request = urllib.request.Request(
+        f"{BASE_URL}/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    started = time.monotonic()
+    try:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+            return json.load(response), time.monotonic() - started
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors="replace").strip()
+        die(f"the server returned HTTP {error.code}: {detail}")
+
+
+def status():
+    model = health()
+    if model:
+        print(f"up pid {server_pid()} model {model}")
+        return 0
+    stale = read_pid()
+    print(f"down stale pidfile pid {stale}" if stale else "down")
+    return 1
+
+
+def stop():
+    """Stop the server, treating an already stopped server as success."""
+    pid = server_pid()
+    if pid is None:
+        stale = read_pid()
+        PIDFILE.unlink(missing_ok=True)
+        model = health()
+        if model:
+            print(
+                f"swift-ask: {model} is still serving on {BASE_URL} but no pidfile"
+                " names it, so nothing was signalled",
+                file=sys.stderr,
+            )
+            return 1
+        note = "no server running"
+        if stale is not None:
+            note += f", discarded a pidfile naming pid {stale}"
+        print(f"swift-ask: {note}", file=sys.stderr)
+        return 0
+    os.killpg(pid, signal.SIGTERM)
+    deadline = time.monotonic() + STOP_TIMEOUT
+    while time.monotonic() < deadline:
+        if server_pid() is None:
+            break
+        time.sleep(0.2)
+    else:
+        os.killpg(pid, signal.SIGKILL)
+    PIDFILE.unlink(missing_ok=True)
+    print(f"swift-ask: stopped pid {pid}", file=sys.stderr)
+    return 0
+
+
+def ask_once_restarting(prompt, args):
+    """Ask, restarting the server once when it goes away before the request lands.
+
+    An HTTP status is not retried: that is the request's own fault.
+    """
+    effort = "none" if args.no_think else args.effort
+    for attempt in (1, 2):
+        model = ensure_running()
+        try:
+            return ask(model, prompt, args.system, effort, args.max_tokens)
+        except (OSError, ValueError) as error:
+            if attempt == 2:
+                die(f"the completion request failed: {error}")
+            print(
+                f"swift-ask: the server went away, restarting it: {error}",
+                file=sys.stderr,
+            )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("prompt", nargs="?", help="prompt text, or stdin when absent")
+    parser.add_argument("--no-think", action="store_true")
+    parser.add_argument("--effort", choices=EFFORTS, default="medium")
+    parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument("--system")
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--stop", action="store_true")
+    args = parser.parse_args()
+
+    if args.status:
+        return status()
+    if args.stop:
+        return stop()
+
+    prompt = (args.prompt if args.prompt is not None else sys.stdin.read()).strip()
+    if not prompt:
+        print("swift-ask: no prompt on the command line or stdin", file=sys.stderr)
+        return 2
+
+    payload, elapsed = ask_once_restarting(prompt, args)
+    choice = payload["choices"][0]
+    usage = payload.get("usage") or {}
+    completion_tokens = usage.get("completion_tokens")
+    if completion_tokens is not None and elapsed > 0:
+        print(
+            f"swift-ask: {completion_tokens} tokens"
+            f" at {completion_tokens / elapsed:.1f} tok/s",
+            file=sys.stderr,
+        )
+    message = choice["message"]
+    content = message.get("content") or ""
+    if choice.get("finish_reason") == "length" and not content:
+        print(
+            "swift-ask: the token budget ran out while thinking, raise --max-tokens",
+            file=sys.stderr,
+        )
+        return 1
+    print(content)
+    if choice.get("finish_reason") == "length":
+        print("swift-ask: the answer was cut off at --max-tokens", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

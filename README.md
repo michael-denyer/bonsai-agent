@@ -4,6 +4,8 @@ A Claude Code subagent that runs tasks on a local [Bonsai 2 27B](https://hugging
 
 PrismML ships no MLX server for Bonsai 2. `mlx_lm.server` and `mlx_vlm.server` load the pack without its Hadamard transform and return wrong output with no error. `server.py` loads the model through the loader bundled in the pack instead.
 
+The repository also ships a `swift` subagent. It uses the same relay pattern to run tasks on [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF), a Qwen3.8-27B fine-tune served by [splash](https://github.com/incoai/splash). See [Swift 1.5 through splash](#swift-15-through-splash).
+
 ## Quick start
 
 Requires Apple Silicon, [`uv`](https://docs.astral.sh/uv/), and about 12 GB of disk.
@@ -53,6 +55,32 @@ The prompt comes from stdin when no positional argument is given. Only the answe
 
 The server also answers `POST /v1/chat/completions` in the OpenAI shape, without streaming, and `GET /health`.
 
+## Swift 1.5 through splash
+
+`swift-ask` and `agents/swift.md` are the Swift 1.5 counterparts of `bonsai-ask` and `agents/bonsai.md`. The server is splash, not `server.py`, so the only extra requirement is `brew install incoai/tap/splash`. `install.sh` links both entry points and warns when splash is missing.
+
+```bash
+swift-ask --no-think "What is 17 * 23? Reply with the number only."
+```
+
+In Claude Code, ask for the `swift` agent by name. Its description tells the main session to prefer it over `bonsai`.
+
+```
+swift-ask [--no-think] [--effort {max,xhigh,high,medium,low,minimal}] [--max-tokens N] [--system TEXT] [PROMPT]
+swift-ask --status
+swift-ask --stop
+```
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SWIFT_HOME` | `~/.local/share/swift` | Logs, pidfile, start lock. |
+| `SWIFT_MODEL` | `ukisai/Swift-1.5-Qwen3.8-27B-GGUF:Q4_K_M` | The model splash serves, as `splash serve --model` takes it. |
+| `SWIFT_PORT` | `8000` | Server port on `127.0.0.1`, splash's default. |
+
+`swift-ask` decides what to do from `GET /ready` and its pidfile, with the same table as `bonsai-ask`. It starts `splash serve --model $SWIFT_MODEL --language-only --no-webui` detached, and its pidfile identity check requires a `splash serve` command line that names the model. The first start downloads the 17.4 GB GGUF from the Hugging Face Hub into the Hub cache and can take as long as the connection allows, so the ready wait is 30 minutes. Later starts load from the cache in about 8 seconds, plus about 30 seconds when splash calibrates its Neural Engine split, and a cold `swift-ask` call with cached weights answered in 23 seconds on an M5 Pro on 2026-10-13. The same machine decoded a 98-token answer at 58 tokens per second and 4-token answers at about 16. splash releases the weights after 10 idle minutes and reloads them on the next request.
+
+The model is ukisai's GGUF release because splash 1.3.1 stopped loading Splash packages ([incoai/splash#335](https://github.com/incoai/splash/pull/335)), so the older `SiliconSpecies/Swift-1.5-Qwen3.8-27B-Splash` package does not load on 1.3.1 or later. The MLX release `ukisai/Swift-1.5-4bit-MLX` loads on splash 1.3.1 but returns mixed-script garbage for every prompt, with or without `--disable-ane`, measured on 2026-10-13 on an M5 Pro. That checkpoint quantizes its embedding table and output head, and splash's mixed-precision MLX loading is four days old, so the GGUF path is the one this repository uses. The weights are under the swift-open-license-1.0 that the model repository carries.
+
 ## The MLX runtime
 
 `install.sh` installs the stock `mlx==0.32.2` wheel. The Bonsai 2 pack uses only stock MLX operations, so it needs nothing from the [PrismML MLX fork](https://github.com/PrismML-Eng/mlx).
@@ -91,6 +119,7 @@ The fork's `prism` branch is not used. It predates `mx.new_thread_local_stream`,
 
 - `agents/bonsai.md` is the subagent definition, linked into `~/.claude/agents/`.
 - `bonsai-ask` is the client and launcher. Python standard library only.
+- `agents/swift.md` and `swift-ask` are the same two pieces for Swift 1.5 through splash.
 - `server.py` is the model server. It runs in the venv.
 - `install.sh` installs the runtime, downloads the model, and links the two entry points.
 - `tools/bench.py` measures decode and prompt-processing speed and gates correctness against a recorded reference.
