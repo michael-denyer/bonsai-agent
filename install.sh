@@ -1,5 +1,6 @@
 #!/bin/sh
-# Install the Bonsai 2 27B runtime, model, launcher and Claude Code subagent.
+# Link the Swift 1.5 launcher and Claude Code subagent, which run on splash,
+# and install the Bonsai 2 27B runtime, model, launcher and subagent.
 # Safe to re-run: every step checks for its own result first.
 #
 # BONSAI_MLX=pypi (default) installs the stock mlx wheel pinned in requirements.txt.
@@ -77,6 +78,11 @@ fi
 mkdir -p "$HOME/.local/bin" "$HOME/.claude/agents"
 ln -sf "$REPO_DIR/bonsai-ask" "$HOME/.local/bin/bonsai-ask"
 ln -sf "$REPO_DIR/agents/bonsai.md" "$HOME/.claude/agents/bonsai.md"
+ln -sf "$REPO_DIR/swift-ask" "$HOME/.local/bin/swift-ask"
+ln -sf "$REPO_DIR/agents/swift.md" "$HOME/.claude/agents/swift.md"
+command -v splash >/dev/null ||
+    echo "swift-ask needs splash, which is not installed: brew install incoai/tap/splash" >&2
 
 "$VENV/bin/python" -c "import mlx.core as mx; print('mlx', mx.__version__, mx.default_device())"
 echo "Installed. Try: bonsai-ask --no-think 'What is 17 * 23?'"
+echo "Or Swift 1.5 through splash: swift-ask --no-think 'What is 17 * 23?'"
