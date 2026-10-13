@@ -1,28 +1,32 @@
-# bonsai-agent
+# swift-agent
 
-A Claude Code subagent that runs tasks on a local [Bonsai 2 27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit) model. The model runs on Apple Silicon through MLX. The server starts itself on the first request and exits when idle.
+Claude Code subagents that run tasks on local models on Apple Silicon. The `swift` agent runs [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF), a Qwen3.8-27B fine-tune served by [splash](https://github.com/incoai/splash). The `bonsai` agent runs [Bonsai 2 27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit) through MLX. Each server starts itself on the first request.
+
+Both agents use the same relay pattern. See [Swift 1.5 through splash](#swift-15-through-splash) for the Swift side. The other sections describe the Bonsai side.
 
 PrismML ships no MLX server for Bonsai 2. `mlx_lm.server` and `mlx_vlm.server` load the pack without its Hadamard transform and return wrong output with no error. `server.py` loads the model through the loader bundled in the pack instead.
 
-The repository also ships a `swift` subagent. It uses the same relay pattern to run tasks on [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF), a Qwen3.8-27B fine-tune served by [splash](https://github.com/incoai/splash). See [Swift 1.5 through splash](#swift-15-through-splash).
-
 ## Quick start
 
-Requires Apple Silicon, [`uv`](https://docs.astral.sh/uv/), and about 12 GB of disk.
+Requires Apple Silicon, [`uv`](https://docs.astral.sh/uv/), and [splash](https://github.com/incoai/splash) for Swift 1.5. Bonsai 2 takes about 12 GB of disk and Swift 1.5 about 17.4 GB.
 
 ```bash
-git clone https://github.com/michael-denyer/bonsai-agent.git
+git clone https://github.com/michael-denyer/swift-agent.git
 ```
 
 ```bash
-./bonsai-agent/install.sh
+./swift-agent/install.sh
+```
+
+```bash
+swift-ask --no-think "What is 17 * 23? Reply with the number only."
 ```
 
 ```bash
 bonsai-ask --no-think "What is 17 * 23? Reply with the number only."
 ```
 
-In Claude Code, ask for the `bonsai` agent by name, or say "use the local model".
+In Claude Code, ask for the `swift` or `bonsai` agent by name, or say "use the local model".
 
 ## How it works
 

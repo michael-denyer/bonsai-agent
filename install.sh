@@ -1,6 +1,6 @@
 #!/bin/sh
-# Install the Bonsai 2 27B runtime, model, launcher and Claude Code subagent,
-# and link the Swift 1.5 launcher and subagent, which run on splash.
+# Link the Swift 1.5 launcher and Claude Code subagent, which run on splash,
+# and install the Bonsai 2 27B runtime, model, launcher and subagent.
 # Safe to re-run: every step checks for its own result first.
 #
 # BONSAI_MLX=pypi (default) installs the stock mlx wheel pinned in requirements.txt.
